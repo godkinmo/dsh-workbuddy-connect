@@ -546,7 +546,8 @@ function identityHeaders(credential: WorkBuddyCredential): Record<string, string
  * Normalize an OpenAI chat-completions body for the WorkBuddy upstream:
  * force `stream: true` (the upstream rejects non-streaming), flatten
  * `tool_choice` (the upstream's field is a string; object forms return 400),
- * and rewrite `developer` messages as `system`.
+ * rewrite `developer` messages as `system`, and strip the harness's identity
+ * prompt from the outgoing system prompt.
  *
  * The `developer` rewrite is load-bearing: pi-ai emits the system prompt as
  * `role: "developer"` (the OpenAI convention it adopted), but the WorkBuddy
@@ -566,6 +567,7 @@ export function prepareChatBody(source: string): string {
   obj['stream'] = true
   normalizeDeveloperRole(obj)
   normalizeToolChoice(obj)
+  stripHarnessIdentityPrompt(obj)
   return JSON.stringify(obj)
 }
 
@@ -618,6 +620,143 @@ function normalizeToolChoice(obj: Record<string, unknown>): void {
     return
   }
   delete obj['tool_choice']
+}
+
+/**
+ * The harness's own identity sentence that rides in the outgoing system
+ * prompt.
+ *
+ * DSH injects "You are an AI agent powered by DeepSeek Harness." into every
+ * chat request. This fork removes it before the body reaches the WorkBuddy
+ * upstream — in {@link stripHarnessIdentityPrompt}, applied to both regions
+ * via {@link prepareChatBody}. User messages are never touched: only
+ * `system`/`developer` roles are inspected.
+ */
+export const HARNESS_IDENTITY_PROMPT = 'You are an AI agent powered by DeepSeek Harness.'
+
+/**
+ * Remove the harness's identity sentence from one text, or return `null` when
+ * the text does not carry it.
+ *
+ * Whole lines that consist only of the sentence (any surrounding whitespace)
+ * are dropped, so the prompt's usual form — a line of its own in the system
+ * prompt — leaves no blank gap. Inline occurrences inside a larger line are
+ * spliced out of that line. When anything was removed, the edges are trimmed
+ * so no dangling blank line survives the drop; when nothing was, the text is
+ * returned untouched.
+ */
+function stripHarnessIdentityText(text: string): string | null {
+  if (!text.includes(HARNESS_IDENTITY_PROMPT)) return null
+  const kept: string[] = []
+  let stripped = false
+  for (const line of text.split('\n')) {
+    if (line.includes(HARNESS_IDENTITY_PROMPT)) {
+      stripped = true
+      // The optional leading space rides along, so an inline splice keeps the
+      // line's natural single spacing ("Prefix. <prompt> Suffix." splices to
+      // "Prefix. Suffix.").
+      const remainder = line.replace(/[ ]?You are an AI agent powered by DeepSeek Harness\./g, '')
+      // A line that carried the sentence and nothing else disappears; a line
+      // with other content keeps that content.
+      if (remainder.trim() !== '') kept.push(remainder)
+      continue
+    }
+    kept.push(line)
+  }
+  if (!stripped) return null
+  while (kept.length > 0) {
+    const first = kept[0]
+    if (first === undefined || first.trim() !== '') break
+    kept.shift()
+  }
+  while (kept.length > 0) {
+    const last = kept[kept.length - 1]
+    if (last === undefined || last.trim() !== '') break
+    kept.pop()
+  }
+  return kept.join('\n')
+}
+
+/** True when `role` is one of the two prompt-carrying roles. */
+function isSystemRole(role: unknown): boolean {
+  return role === 'system' || role === 'developer'
+}
+
+/**
+ * Strip the identity sentence out of one message's content.
+ *
+ * Returns `true` when the removal emptied the message (string content reduced
+ * to nothing, or every content part carrying the sentence gone), signalling to
+ * the caller that the message should be dropped; `false` otherwise. Content
+ * that is not a string or a text-parts array is left alone.
+ */
+function stripHarnessIdentityFromMessage(wrapped: Record<string, unknown>): boolean {
+  if (!isSystemRole(wrapped['role'])) return false
+  const content = wrapped['content']
+  if (typeof content === 'string') {
+    const stripped = stripHarnessIdentityText(content)
+    if (stripped === null) return false
+    if (stripped === '') {
+      delete wrapped['content']
+      return true
+    }
+    wrapped['content'] = stripped
+    return false
+  }
+  if (!Array.isArray(content)) return false
+  const keptParts: unknown[] = []
+  let strippedAny = false
+  for (const part of content) {
+    const text = typeof part === 'object' && part !== null && !Array.isArray(part) && typeof (part as Record<string, unknown>)['text'] === 'string'
+      ? (part as Record<string, unknown>)['text'] as string
+      : undefined
+    if (text === undefined) {
+      keptParts.push(part)
+      continue
+    }
+    const stripped = stripHarnessIdentityText(text)
+    if (stripped === null) {
+      keptParts.push(part)
+      continue
+    }
+    strippedAny = true
+    if (stripped.trim() !== '') keptParts.push({ ...(part as Record<string, unknown>), 'text': stripped })
+  }
+  if (strippedAny) {
+    if (keptParts.length === 0) {
+      delete wrapped['content']
+      return true
+    }
+    wrapped['content'] = keptParts
+  }
+  return false
+}
+
+/**
+ * Remove the harness's identity prompt from the outgoing messages.
+ *
+ * Runs on `system`/`developer` messages only (the caller has already
+ * normalized `developer` to `system`; the check keeps both accepted so an
+ * unexpected order of operations still strips). A message emptied by the
+ * removal is dropped entirely; no placeholder is left behind. On the
+ * international endpoint the region prepare re-checks the first message and
+ * falls back to its minimal system prompt if the removal emptied the front,
+ * so the gateway's "first message is not system prompt" precondition the
+ * emptying might otherwise trip stays satisfied.
+ */
+function stripHarnessIdentityPrompt(obj: Record<string, unknown>): void {
+  const messages = obj['messages']
+  if (!Array.isArray(messages)) return
+  const kept: unknown[] = []
+  for (const message of messages) {
+    if (typeof message !== 'object' || message === null || Array.isArray(message)) {
+      kept.push(message)
+      continue
+    }
+    if (stripHarnessIdentityFromMessage(message as Record<string, unknown>)) continue
+    kept.push(message)
+  }
+  obj['messages'] = kept
 }
 
 /** One JSON-envelope response from the upstream, already unwrapped. */
