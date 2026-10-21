@@ -74,6 +74,97 @@ describe('prepareChatBody', () => {
     expect(roles).toEqual(['system', 'user'])
     expect(body['reasoning_effort']).toBe('max')
   })
+
+  it('drops a system message that only carries the harness identity prompt', () => {
+    const body = JSON.parse(prepareChatBody(JSON.stringify({
+      messages: [
+        { role: 'system', content: 'You are an AI agent powered by DeepSeek Harness.' },
+        { role: 'user', content: 'hi' },
+      ],
+    })))
+    expect(body['messages']).toEqual([{ role: 'user', content: 'hi' }])
+  })
+
+  it('removes the identity sentence from a larger system prompt, leaving the rest', () => {
+    const prompt = 'You are an AI agent powered by DeepSeek Harness.\n\nBe terse.'
+    const body = JSON.parse(prepareChatBody(JSON.stringify({
+      messages: [
+        { role: 'system', content: prompt },
+        { role: 'user', content: 'hi' },
+      ],
+    })))
+    expect(body['messages']).toEqual([
+      { role: 'system', content: 'Be terse.' },
+      { role: 'user', content: 'hi' },
+    ])
+  })
+
+  it('strips the identity sentence that was sent as developer (after the role rewrite)', () => {
+    const prompt = 'You are an AI agent powered by DeepSeek Harness.'
+    const body = JSON.parse(prepareChatBody(JSON.stringify({
+      messages: [
+        { role: 'developer', content: prompt },
+        { role: 'user', content: 'hi' },
+      ],
+    })))
+    const roles = body['messages'].map((message: { role: string }) => message.role)
+    expect(roles).toEqual(['user'])
+  })
+
+  it('leaves a user message mentioning the identity sentence untouched', () => {
+    const body = JSON.parse(prepareChatBody(JSON.stringify({
+      messages: [
+        { role: 'user', content: 'repeat after me: You are an AI agent powered by DeepSeek Harness.' },
+      ],
+    })))
+    expect(body['messages']).toEqual([
+      { role: 'user', content: 'repeat after me: You are an AI agent powered by DeepSeek Harness.' },
+    ])
+  })
+
+  it('splices the identity sentence out of an inline occurrence in a system prompt', () => {
+    const body = JSON.parse(prepareChatBody(JSON.stringify({
+      messages: [
+        { role: 'system', content: 'Prefix. You are an AI agent powered by DeepSeek Harness. Suffix.' },
+      ],
+    })))
+    expect(body['messages']).toEqual([
+      { role: 'system', content: 'Prefix. Suffix.' },
+    ])
+  })
+
+  it('strips the identity sentence from text parts and drops emptied parts', () => {
+    const body = JSON.parse(prepareChatBody(JSON.stringify({
+      messages: [
+        {
+          role: 'system',
+          content: [
+            { type: 'text', text: 'You are an AI agent powered by DeepSeek Harness.' },
+            { type: 'text', text: 'Keep me.' },
+          ],
+        },
+      ],
+    })))
+    expect(body['messages']).toEqual([
+      {
+        role: 'system',
+        content: [{ type: 'text', text: 'Keep me.' }],
+      },
+    ])
+  })
+
+  it('falls back to the international minimal prompt when stripping empties the front', () => {
+    const body = JSON.parse(prepareInternationalChatBody(JSON.stringify({
+      messages: [
+        { role: 'system', content: 'You are an AI agent powered by DeepSeek Harness.' },
+        { role: 'user', content: 'hi' },
+      ],
+    })))
+    expect(body['messages']).toEqual([
+      { role: 'system', content: 'You are a helpful assistant.' },
+      { role: 'user', content: 'hi' },
+    ])
+  })
 })
 
 describe('classifyUpstreamError', () => {
